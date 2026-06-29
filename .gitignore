@@ -1,0 +1,7 @@
+node_modules/
+.env
+state.json
+*.log
+# local-only config (keeps wallet addresses out of the repo)
+wallet.local.fish
+*.local.fish
