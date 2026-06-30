@@ -191,12 +191,14 @@ async function sendTelegram(text) {
   if (!res.ok) throw new Error(`Telegram ${res.status}: ${await res.text()}`);
 }
 
-async function sendPhoto(photo, caption) {
+async function sendPhoto(photo, caption, replyMarkup) {
   const url = `https://api.telegram.org/bot${cfg.botToken}/sendPhoto`;
+  const body = { chat_id: cfg.chatId, photo, caption };
+  if (replyMarkup) body.reply_markup = replyMarkup;
   const res = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chat_id: cfg.chatId, photo, caption }),
+    body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error(`Telegram sendPhoto ${res.status}: ${await res.text()}`);
 }
@@ -272,13 +274,20 @@ async function priceMessage() {
   return lines.join("\n");
 }
 
-// Build a 24h MIM/USD chart via QuickChart and return a short image URL.
-async function chartUrl() {
+// Supported chart windows -> minutes. CoinGecko 1-day data is ~5-min
+// granularity, so very short windows (30m/1h) have relatively few points.
+const RANGES = { "30m": 30, "1h": 60, "6h": 360, "24h": 1440 };
+
+// Build a MIM/USD chart for the last `minutes` via QuickChart; return image URL.
+async function chartUrl(minutes, label) {
   const res = await fetch(`${CG}/coins/${MIM_CG_ID}/market_chart?vs_currency=usd&days=1`);
   if (!res.ok) throw new Error(`CoinGecko ${res.status}`);
-  const pts = (await res.json()).prices || [];
-  if (!pts.length) return null;
-  const step = Math.max(1, Math.floor(pts.length / 48)); // ~48 points
+  const all = (await res.json()).prices || [];
+  if (!all.length) return null;
+  const cutoff = Date.now() - minutes * 60 * 1000;
+  let pts = all.filter(([t]) => t >= cutoff);
+  if (pts.length < 2) pts = all.slice(-2); // fallback if the window is too sparse
+  const step = Math.max(1, Math.floor(pts.length / 60)); // cap ~60 points
   const sampled = pts.filter((_, i) => i % step === 0);
   const labels = sampled.map(([t]) => new Date(t).toISOString().slice(11, 16));
   const data = sampled.map(([, p]) => Number(p.toFixed(4)));
@@ -286,7 +295,7 @@ async function chartUrl() {
     type: "line",
     data: { labels, datasets: [{ label: "MIM/USD", data, borderColor: "rgb(54,162,235)",
       backgroundColor: "rgba(54,162,235,0.15)", fill: true, pointRadius: 0, borderWidth: 2 }] },
-    options: { plugins: { title: { display: true, text: `MIM/USD — 24h (now $${data[data.length - 1].toFixed(4)})` } },
+    options: { plugins: { title: { display: true, text: `MIM/USD — last ${label} (now $${data[data.length - 1].toFixed(4)})` } },
       scales: { x: { ticks: { maxTicksLimit: 8 } } } },
   };
   const create = await fetch("https://quickchart.io/chart/create", {
@@ -298,6 +307,27 @@ async function chartUrl() {
   return (await create.json()).url || null;
 }
 
+// Inline keyboard to switch ranges with one tap (active one marked with •).
+function rangeKeyboard(active) {
+  return { inline_keyboard: [Object.keys(RANGES).map((k) => ({ text: (k === active ? "• " : "") + k, callback_data: "chart:" + k }))] };
+}
+
+async function sendChart(rangeKey) {
+  const key = RANGES[rangeKey] ? rangeKey : "24h";
+  const u = await chartUrl(RANGES[key], key);
+  if (u) await sendPhoto(u, `MIM/USD — last ${key}`, rangeKeyboard(key));
+  else await sendTelegram("Chart unavailable right now.");
+}
+
+async function answerCallback(id) {
+  try {
+    await fetch(`https://api.telegram.org/bot${cfg.botToken}/answerCallbackQuery`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ callback_query_id: id }),
+    });
+  } catch { /* non-fatal */ }
+}
+
 // ---------------------------------------------------------------------------
 // Telegram command handling (long-poll getUpdates) — /price, /chart, /help
 // ---------------------------------------------------------------------------
@@ -307,11 +337,9 @@ async function handleCommand(text) {
   if (cmd === "price" || cmd === "p") {
     await sendTelegram(await priceMessage());
   } else if (cmd === "chart" || cmd === "c") {
-    const u = await chartUrl();
-    if (u) await sendPhoto(u, "MIM/USD — last 24h");
-    else await sendTelegram("Chart unavailable right now.");
+    await sendChart(text.trim().split(/\s+/)[1]); // optional range: 30m|1h|6h|24h
   } else if (cmd === "help" || cmd === "start") {
-    await sendTelegram("*MIM bot*\n/price — spot + live pool price (1k/10k/50k MIM)\n/chart — 24h MIM/USD chart");
+    await sendTelegram("*MIM bot*\n/price — spot + live pool price (1k/10k/50k MIM)\n/chart [30m|1h|6h|24h] — MIM/USD chart (default 24h; tap buttons to switch)");
   }
 }
 
@@ -326,9 +354,17 @@ async function commandLoop() {
       for (const u of (await res.json()).result || []) {
         offset = u.update_id + 1;
         const msg = u.message;
-        if (!msg || !msg.text) continue;
-        if (String(msg.chat.id) !== String(cfg.chatId)) continue; // only the owner chat
-        await handleCommand(msg.text).catch((e) => console.error(`cmd ${msg.text}: ${e.message}`));
+        if (msg && msg.text) {
+          if (String(msg.chat.id) !== String(cfg.chatId)) continue; // only the owner chat
+          await handleCommand(msg.text).catch((e) => console.error(`cmd ${msg.text}: ${e.message}`));
+        } else if (u.callback_query) {
+          const cq = u.callback_query;
+          await answerCallback(cq.id);
+          if (String(cq.message?.chat?.id) !== String(cfg.chatId)) continue;
+          if (cq.data && cq.data.startsWith("chart:")) {
+            await sendChart(cq.data.slice(6)).catch((e) => console.error(`cb ${cq.data}: ${e.message}`));
+          }
+        }
       }
     } catch (e) {
       console.error(`Command loop: ${e.message}`);
