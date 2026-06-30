@@ -48,8 +48,13 @@ async function loadState() {
 }
 
 async function saveState(state) {
-  await mkdir(dirname(cfg.stateFile), { recursive: true }).catch(() => {});
-  await writeFile(cfg.stateFile, JSON.stringify(state, null, 2));
+  // Never let a non-writable STATE_FILE crash the process — log and move on.
+  try {
+    await mkdir(dirname(cfg.stateFile), { recursive: true });
+    await writeFile(cfg.stateFile, JSON.stringify(state, null, 2));
+  } catch (e) {
+    console.warn(`Could not persist state to ${cfg.stateFile}: ${e.message}`);
+  }
 }
 
 // A trade is "after" the high-water mark if its (block, logIndex) is greater.
@@ -186,6 +191,16 @@ async function sendTelegram(text) {
   if (!res.ok) throw new Error(`Telegram ${res.status}: ${await res.text()}`);
 }
 
+async function sendPhoto(photo, caption) {
+  const url = `https://api.telegram.org/bot${cfg.botToken}/sendPhoto`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ chat_id: cfg.chatId, photo, caption }),
+  });
+  if (!res.ok) throw new Error(`Telegram sendPhoto ${res.status}: ${await res.text()}`);
+}
+
 async function notifyTrade(trade) {
   const sellMeta = await tokenMeta(trade.sellToken);
   const buyMeta = await tokenMeta(trade.buyToken);
@@ -204,6 +219,122 @@ async function notifyTrade(trade) {
   ].filter(Boolean);
 
   await sendTelegram(lines.join("\n"));
+}
+
+// ---------------------------------------------------------------------------
+// On-demand price + 24h chart (CoinGecko spot + live Curve pool price)
+// ---------------------------------------------------------------------------
+
+const CG = process.env.COINGECKO_BASE || "https://api.coingecko.com/api/v3";
+const MIM_CG_ID = process.env.MIM_CG_ID || "magic-internet-money";
+// Curve MIM-3CRV metapool + the 3pool (to value the 3CRV leg in USD).
+const MIM_POOL = "0x5a6a4d54456819380173272a5e8e9b9904bdf41b";
+const THREEPOOL = "0xbebc44782c7db0a1a60cb6fe97d0b483032ff1c7";
+const hx = (n) => BigInt(n).toString(16).padStart(64, "0");
+
+async function cgSpot() {
+  const res = await fetch(`${CG}/simple/price?ids=${MIM_CG_ID}&vs_currencies=usd&include_24hr_change=true`);
+  if (!res.ok) throw new Error(`CoinGecko ${res.status}`);
+  const m = (await res.json())[MIM_CG_ID] || {};
+  return { usd: m.usd, chg: m.usd_24h_change };
+}
+
+// What you'd actually receive selling `clipMim` MIM into the pool, per MIM (USD).
+async function poolPriceUsd(clipMim) {
+  try {
+    const dx = BigInt(clipMim) * 10n ** 18n;
+    const dyHex = await ethCall(MIM_POOL, "0x5e0d443f" + hx(0) + hx(1) + hx(dx)); // get_dy(0,1,dx)
+    const vpHex = await ethCall(THREEPOOL, "0xbb7b8b80"); // get_virtual_price()
+    if (!dyHex || !vpHex) return null;
+    const usdOut = (Number(BigInt(dyHex)) / 1e18) * (Number(BigInt(vpHex)) / 1e18);
+    return usdOut / clipMim;
+  } catch {
+    return null;
+  }
+}
+
+async function priceMessage() {
+  let spotLine = "Spot: n/a";
+  try {
+    const s = await cgSpot();
+    if (s.usd != null) {
+      const chg = s.chg == null ? "" : ` (${s.chg >= 0 ? "+" : ""}${s.chg.toFixed(1)}% 24h)`;
+      spotLine = `Spot (CoinGecko): *$${s.usd.toFixed(4)}*${chg}`;
+    }
+  } catch (e) {
+    spotLine = `Spot: n/a (${e.message})`;
+  }
+  const lines = [`*MIM price*`, spotLine, `Live pool — what you'd actually get:`];
+  for (const c of [1000, 10000, 50000]) {
+    const p = await poolPriceUsd(c);
+    lines.push(`  ${c.toLocaleString("en-US")} MIM → ${p ? "$" + p.toFixed(4) + "/MIM" : "_can't fill_"}`);
+  }
+  return lines.join("\n");
+}
+
+// Build a 24h MIM/USD chart via QuickChart and return a short image URL.
+async function chartUrl() {
+  const res = await fetch(`${CG}/coins/${MIM_CG_ID}/market_chart?vs_currency=usd&days=1`);
+  if (!res.ok) throw new Error(`CoinGecko ${res.status}`);
+  const pts = (await res.json()).prices || [];
+  if (!pts.length) return null;
+  const step = Math.max(1, Math.floor(pts.length / 48)); // ~48 points
+  const sampled = pts.filter((_, i) => i % step === 0);
+  const labels = sampled.map(([t]) => new Date(t).toISOString().slice(11, 16));
+  const data = sampled.map(([, p]) => Number(p.toFixed(4)));
+  const chart = {
+    type: "line",
+    data: { labels, datasets: [{ label: "MIM/USD", data, borderColor: "rgb(54,162,235)",
+      backgroundColor: "rgba(54,162,235,0.15)", fill: true, pointRadius: 0, borderWidth: 2 }] },
+    options: { plugins: { title: { display: true, text: `MIM/USD — 24h (now $${data[data.length - 1].toFixed(4)})` } },
+      scales: { x: { ticks: { maxTicksLimit: 8 } } } },
+  };
+  const create = await fetch("https://quickchart.io/chart/create", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ chart, width: 640, height: 360, backgroundColor: "white" }),
+  });
+  if (!create.ok) return null;
+  return (await create.json()).url || null;
+}
+
+// ---------------------------------------------------------------------------
+// Telegram command handling (long-poll getUpdates) — /price, /chart, /help
+// ---------------------------------------------------------------------------
+
+async function handleCommand(text) {
+  const cmd = text.trim().split(/\s+/)[0].toLowerCase().replace(/^\//, "").split("@")[0];
+  if (cmd === "price" || cmd === "p") {
+    await sendTelegram(await priceMessage());
+  } else if (cmd === "chart" || cmd === "c") {
+    const u = await chartUrl();
+    if (u) await sendPhoto(u, "MIM/USD — last 24h");
+    else await sendTelegram("Chart unavailable right now.");
+  } else if (cmd === "help" || cmd === "start") {
+    await sendTelegram("*MIM bot*\n/price — spot + live pool price (1k/10k/50k MIM)\n/chart — 24h MIM/USD chart");
+  }
+}
+
+async function commandLoop() {
+  let offset;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    try {
+      const url = `https://api.telegram.org/bot${cfg.botToken}/getUpdates?timeout=30${offset ? `&offset=${offset}` : ""}`;
+      const res = await fetch(url, { signal: AbortSignal.timeout(45000) });
+      if (!res.ok) throw new Error(`getUpdates ${res.status}`);
+      for (const u of (await res.json()).result || []) {
+        offset = u.update_id + 1;
+        const msg = u.message;
+        if (!msg || !msg.text) continue;
+        if (String(msg.chat.id) !== String(cfg.chatId)) continue; // only the owner chat
+        await handleCommand(msg.text).catch((e) => console.error(`cmd ${msg.text}: ${e.message}`));
+      }
+    } catch (e) {
+      console.error(`Command loop: ${e.message}`);
+      await sleep(3000);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -244,7 +375,11 @@ async function main() {
     }
   }
 
-  // Poll forever.
+  // Run the fill-poller and the Telegram command loop (/price, /chart) together.
+  await Promise.all([fillPollLoop(state), commandLoop()]);
+}
+
+async function fillPollLoop(state) {
   // eslint-disable-next-line no-constant-condition
   while (true) {
     try {

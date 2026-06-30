@@ -17,6 +17,19 @@ with `sellToken=MIM`, `sellAmount`, `buyToken`, `buyAmount`, `txHash`,
 `blockNumber`, `logIndex`. There is no timestamp, so ordering/dedupe uses
 `(blockNumber, logIndex)`.
 
+## On-demand commands
+
+Besides push alerts, the bot replies to messages **from `TELEGRAM_CHAT_ID`** only:
+
+- `/price` — CoinGecko spot + live **Curve-pool** price for 1k / 10k / 50k MIM (what you'd actually receive on a sale).
+- `/chart` — a **24h MIM/USD chart** (rendered via QuickChart, sent as a photo).
+- `/help` — command list.
+
+This uses Telegram long-polling (`getUpdates`), so **run only one instance** at a
+time (the Railway worker *or* a local run, not both) — two consumers conflict
+(HTTP 409). Optional env: `MIM_CG_ID` (default `magic-internet-money`),
+`COINGECKO_BASE`.
+
 ## 1. Create a Telegram bot (2 minutes)
 
 1. In Telegram, message **@BotFather** → `/newbot` → follow prompts.
